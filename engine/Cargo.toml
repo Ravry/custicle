@@ -1,0 +1,9 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30.12"
+ash = {version = "0.38", features = ["linked"]}
+ash-window = "0.13.0"
