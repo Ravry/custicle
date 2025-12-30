@@ -1,6 +1,8 @@
-use std::{borrow::Cow, ffi::{self, c_char}};
+use std::{borrow::Cow, ffi::{self, CStr, c_char}, os::raw::c_void};
 use winit::{event_loop::{ActiveEventLoop}, raw_window_handle::HasDisplayHandle};
-use ash::{Entry, Instance, ext::debug_utils, vk::{self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT}};
+use ash::{Entry, Instance, ext::debug_utils, vk::{self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, PFN_vkCmdSetRenderingAttachmentLocationsKHR, PhysicalDevice, PhysicalDeviceProperties, PhysicalDeviceType, Queue, QueueFlags}};
+
+use crate::helper;
 
 const DEBUG_MODE_ENABLED: bool = cfg!(debug_assertions); 
 
@@ -36,20 +38,42 @@ unsafe extern "system" fn vulkan_debug_callback(
 //(used to destroy the messenger)
 struct DebugCtx {debug_utils_loader: debug_utils::Instance, debug_call_back: DebugUtilsMessengerEXT }
 
+//wrapper around queue-family-indices
+struct QueueFamilyIndices {
+    graphics_family: Option<u32>
+}
+impl QueueFamilyIndices {
+    fn new() -> Self {
+        Self {
+            graphics_family: None
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.graphics_family.is_some()
+    }
+}
+
+
 pub struct Renderer {
     api_entry: Entry,
+    //connection between application and vulkan lib
     instance: Instance,
-    debug_ctx: Option<DebugCtx>
+    debug_ctx: Option<DebugCtx>,
+    //selected graphics-card
+    physical_device: PhysicalDevice
 }
 impl Renderer {
     pub fn new(event_loop: &ActiveEventLoop) -> Self {
         let api_entry = Entry::linked();
         let (instance, debug_ctx)  = Self::create_instance(&api_entry, &event_loop);
+        let physical_device = Self::select_physical_device(&instance);
 
         Self {
             api_entry,
             instance,
-            debug_ctx
+            debug_ctx,
+            physical_device
         }
     }
 
@@ -75,12 +99,16 @@ impl Renderer {
             //enabling validation layer and debug extension
             //when running in debug mode
             let layer_names : Vec<*const c_char> = vec![c"VK_LAYER_KHRONOS_validation".as_ptr()];
+            let debug_create_info;
             if DEBUG_MODE_ENABLED {
+                debug_create_info = Self::get_debug_create_info();
+                //debug messenger for instance creation/deletion
+                create_info.p_next = &raw const debug_create_info as *const c_void;
+
                 //pushing the debug extension
                 extension_names.push(debug_utils::NAME.as_ptr());
                 //setting up the required validation layer
-                create_info.enabled_layer_count = layer_names.len().try_into()
-                    .expect("failed converting usize into u32");
+                create_info.enabled_layer_count = helper::usize_into_u32(layer_names.len());
                 create_info.pp_enabled_layer_names = &raw const layer_names[0];
 
                 //self explainatory
@@ -89,8 +117,7 @@ impl Renderer {
 
             //setting up the extensions
             //NOTE: below validation layer setup
-            create_info.enabled_extension_count = extension_names.len().try_into()
-                .expect("failed converting usize into u32");
+            create_info.enabled_extension_count = helper::usize_into_u32(extension_names.len());
             create_info.pp_enabled_extension_names = &raw const extension_names[0];
 
             //create vulkan instance
@@ -125,22 +152,25 @@ impl Renderer {
         }); 
     }
 
-    fn create_debug_messenger(api_entry: &Entry, instance: &Instance) -> Option<DebugCtx> {
-        //return if debug mode is disabled
-        if !DEBUG_MODE_ENABLED { return None }
-
-        let debug_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
+    fn get_debug_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+        vk::DebugUtilsMessengerCreateInfoEXT {
             message_severity: 
                 DebugUtilsMessageSeverityFlagsEXT::ERROR | 
-                DebugUtilsMessageSeverityFlagsEXT::WARNING | 
-                DebugUtilsMessageSeverityFlagsEXT::INFO,
+                DebugUtilsMessageSeverityFlagsEXT::WARNING,
             message_type: 
                 DebugUtilsMessageTypeFlagsEXT::GENERAL |
                 DebugUtilsMessageTypeFlagsEXT::VALIDATION |
                 DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
             pfn_user_callback: Some(vulkan_debug_callback),
             ..Default::default()
-        };
+        }
+    }
+
+    fn create_debug_messenger(api_entry: &Entry, instance: &Instance) -> Option<DebugCtx> {
+        //return if debug mode is disabled
+        if !DEBUG_MODE_ENABLED { return None }
+
+        let debug_messenger_create_info = Self::get_debug_create_info();
 
         //create loader and call_back
         let (debug_utils_loader, debug_call_back) = unsafe {
@@ -154,6 +184,68 @@ impl Renderer {
 
         Some(DebugCtx{ debug_utils_loader, debug_call_back })
     }
+
+    fn is_physical_device_suitable(instance: &Instance, physical_device: &PhysicalDevice) -> bool {
+        unsafe {
+            let physical_device_properties= 
+                instance.get_physical_device_properties(*physical_device);
+
+            let _physical_device_features = 
+                instance.get_physical_device_features(*physical_device);
+
+            let queue_families = Self::find_queue_families(&instance, &physical_device);
+
+            let suitable = 
+                queue_families.is_complete();
+
+            if suitable {
+                println!(
+                    "suitable phyiscal-device:\n\t{:?}", 
+                    physical_device_properties.device_name_as_c_str().unwrap()
+                );
+            }
+
+            suitable
+        }
+    }
+
+    fn select_physical_device(instance: &Instance) -> PhysicalDevice {
+        unsafe {
+            let physical_devices = instance.enumerate_physical_devices()
+                .expect("couldn't find any physical device!");
+            assert!(physical_devices.len() > 0, "couldn't find any physical device!");
+            
+            for physical_device in physical_devices.iter() {
+                if Self::is_physical_device_suitable(&instance, &physical_device) {
+                    return *physical_device                    
+                }
+            }
+            
+            panic!("no suitable physical device found!");
+        }
+    }
+
+    fn find_queue_families(instance: &Instance, physical_device: &PhysicalDevice) -> QueueFamilyIndices {
+        let mut queue_family_indices = QueueFamilyIndices::new();
+
+        unsafe {
+            let queue_families = 
+                instance.get_physical_device_queue_family_properties(*physical_device);
+            for (index, queue_family) in queue_families.iter().enumerate() {
+                if queue_family.queue_flags.contains(QueueFlags::GRAPHICS)  {
+                    queue_family_indices.graphics_family = Some(
+                        helper::usize_into_u32(index)
+                    );
+                }
+
+                if queue_family_indices.is_complete() {
+                    break
+                }
+            }
+        }
+
+        queue_family_indices
+    } 
 
     pub fn draw(&self) {}
 }

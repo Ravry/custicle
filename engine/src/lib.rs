@@ -7,6 +7,7 @@ use winit::dpi::LogicalSize;
 use crate::renderer::Renderer;
 
 mod renderer;
+mod helper;
 
 #[derive(Default)]
 pub struct App {
