@@ -1,6 +1,17 @@
-use std::{borrow::Cow, ffi::{self, CStr, c_char}, os::raw::c_void};
-use winit::{event_loop::{ActiveEventLoop}, raw_window_handle::HasDisplayHandle};
-use ash::{Entry, Instance, ext::debug_utils, vk::{self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, PFN_vkCmdSetRenderingAttachmentLocationsKHR, PhysicalDevice, PhysicalDeviceProperties, PhysicalDeviceType, Queue, QueueFlags}};
+use std::borrow::Cow;
+use std::ffi::{self, c_char};
+use std::os::raw::c_void;
+use winit::event_loop::ActiveEventLoop;
+use winit::raw_window_handle::HasDisplayHandle;
+use ash::{
+    Entry,
+    Instance,
+    Device
+};
+use ash::ext::debug_utils;
+use ash::vk::{
+    self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDevice, PhysicalDeviceFeatures, Queue, QueueFlags
+};
 
 use crate::helper;
 
@@ -61,19 +72,26 @@ pub struct Renderer {
     instance: Instance,
     debug_ctx: Option<DebugCtx>,
     //selected graphics-card
-    physical_device: PhysicalDevice
+    physical_device: PhysicalDevice,
+    //usage of graphics-card
+    logical_device: Device,
+    //queue - graphics commands can be sent to
+    graphics_queue: Queue
 }
 impl Renderer {
     pub fn new(event_loop: &ActiveEventLoop) -> Self {
         let api_entry = Entry::linked();
         let (instance, debug_ctx)  = Self::create_instance(&api_entry, &event_loop);
         let physical_device = Self::select_physical_device(&instance);
+        let (logical_device, graphics_queue) = Self::create_logical_device(&instance, &physical_device);
 
         Self {
             api_entry,
             instance,
             debug_ctx,
-            physical_device
+            physical_device,
+            logical_device,
+            graphics_queue
         }
     }
 
@@ -185,6 +203,28 @@ impl Renderer {
         Some(DebugCtx{ debug_utils_loader, debug_call_back })
     }
 
+    fn find_queue_families(instance: &Instance, physical_device: &PhysicalDevice) -> QueueFamilyIndices {
+        let mut queue_family_indices = QueueFamilyIndices::new();
+
+        unsafe {
+            let queue_families = 
+                instance.get_physical_device_queue_family_properties(*physical_device);
+            for (index, queue_family) in queue_families.iter().enumerate() {
+                if queue_family.queue_flags.contains(QueueFlags::GRAPHICS)  {
+                    queue_family_indices.graphics_family = Some(
+                        helper::usize_into_u32(index)
+                    );
+                }
+
+                if queue_family_indices.is_complete() {
+                    break
+                }
+            }
+        }
+
+        queue_family_indices
+    } 
+
     fn is_physical_device_suitable(instance: &Instance, physical_device: &PhysicalDevice) -> bool {
         unsafe {
             let physical_device_properties= 
@@ -225,28 +265,48 @@ impl Renderer {
         }
     }
 
-    fn find_queue_families(instance: &Instance, physical_device: &PhysicalDevice) -> QueueFamilyIndices {
-        let mut queue_family_indices = QueueFamilyIndices::new();
+    fn create_logical_device(instance: &Instance, physical_device: &PhysicalDevice) -> (Device, Queue)  {
+        let queue_families = Self::find_queue_families(&instance, &physical_device); 
+        
+        let queue_priority: f32 = 1.0;
+        
+        //number of queues for a queue family
+        let graphics_queue_create_info = 
+            DeviceQueueCreateInfo {
+                queue_family_index: queue_families.graphics_family.unwrap(),
+                queue_count: 1,
+                p_queue_priorities: &raw const queue_priority,
+                ..Default::default()
+            };
+        
+        let logical_device_features = 
+            PhysicalDeviceFeatures {
+                ..Default::default()
+            };
+        
+        let logical_device_create_info = DeviceCreateInfo {
+            p_queue_create_infos: &raw const graphics_queue_create_info,
+            queue_create_info_count: 1,
+            p_enabled_features: &raw const logical_device_features,
+            ..Default::default()
+        };
 
-        unsafe {
-            let queue_families = 
-                instance.get_physical_device_queue_family_properties(*physical_device);
-            for (index, queue_family) in queue_families.iter().enumerate() {
-                if queue_family.queue_flags.contains(QueueFlags::GRAPHICS)  {
-                    queue_family_indices.graphics_family = Some(
-                        helper::usize_into_u32(index)
-                    );
-                }
+        let logical_device = unsafe {
+            instance
+                .create_device(*physical_device, &logical_device_create_info, None)
+                .expect("failed creating logical device")
+        };
 
-                if queue_family_indices.is_complete() {
-                    break
-                }
-            }
-        }
-
-        queue_family_indices
-    } 
-
+        let graphics_queue = unsafe {
+            logical_device.get_device_queue(
+                queue_families.graphics_family.unwrap(), 
+                0
+            )
+        };
+        
+        (logical_device, graphics_queue)
+    }
+   
     pub fn draw(&self) {}
 }
 impl Drop for Renderer {
@@ -254,6 +314,8 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         println!("cleaning up the renderer!");
         unsafe {
+            //destroy logical device
+            self.logical_device.destroy_device(None);
             //destroy debug_call_back (if it exists)
             if self.debug_ctx.is_some() {
                 let debug_ctx= self.debug_ctx.as_ref();

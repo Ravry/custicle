@@ -17,7 +17,8 @@ pub struct App {
 
 impl App {
     pub fn new() {
-        let event_loop = EventLoop::new().expect("failed creating event loop!");
+        let event_loop = 
+            EventLoop::new().expect("failed creating event loop!");
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = App::default();
         event_loop.run_app(&mut app).expect("failed running app!");
@@ -32,7 +33,8 @@ impl ApplicationHandler for App {
             .with_inner_size(LogicalSize::new(800,600));
 
         self.window = Some(
-            event_loop.create_window(attributes)
+            event_loop
+                .create_window(attributes)
                 .expect("failed creating window!")
         );
 
@@ -54,7 +56,10 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             },
             WindowEvent::RedrawRequested => {
-                self.window.as_ref().unwrap().request_redraw();
+                self.window
+                    .as_ref()
+                    .unwrap()
+                    .request_redraw();
             },
             _ => ()
         }
