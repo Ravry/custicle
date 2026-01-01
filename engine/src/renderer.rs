@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::ffi::{self, c_char};
 use std::os::raw::c_void;
 use winit::event_loop::ActiveEventLoop;
-use winit::raw_window_handle::HasDisplayHandle;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use ash::{
     Entry,
     Instance,
@@ -10,8 +10,9 @@ use ash::{
 };
 use ash::ext::debug_utils;
 use ash::vk::{
-    self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDevice, PhysicalDeviceFeatures, Queue, QueueFlags
+    self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDevice, PhysicalDeviceFeatures, Queue, QueueFlags, SurfaceKHR
 };
+use winit::window::Window;
 
 use crate::helper;
 
@@ -24,53 +25,63 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user_data: *mut std::os::raw::c_void,
 ) -> vk::Bool32 {
-    let callback_data = *p_callback_data;
-    let message_id_number = callback_data.message_id_number;
+    unsafe {
+        let callback_data = *p_callback_data;
+        let message_id_number = callback_data.message_id_number;
 
-    let message_id_name = if callback_data.p_message_id_name.is_null() {
-        Cow::from("")
-    } else {
-        ffi::CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy()
-    };
+        let message_id_name = if callback_data.p_message_id_name.is_null() {
+            Cow::from("")
+        } else {
+            ffi::CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy()
+        };
 
-    let message = if callback_data.p_message.is_null() {
-        Cow::from("")
-    } else {
-        ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy()
-    };
+        let message = if callback_data.p_message.is_null() {
+            Cow::from("")
+        } else {
+            ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy()
+        };
 
-    println!(
-        "{message_severity:?}:\n{message_type:?} [{message_id_name} ({message_id_number})] : {message}\n",
-    );
+        println!(
+            "{message_severity:?}:\n{message_type:?} [{message_id_name} ({message_id_number})] : {message}\n",
+        );
 
-    vk::FALSE
+        vk::FALSE
+    }
 }
+
 //wrapper around debug information
 //(used to destroy the messenger)
 struct DebugCtx {debug_utils_loader: debug_utils::Instance, debug_call_back: DebugUtilsMessengerEXT }
 
 //wrapper around queue-family-indices
+#[derive(Debug)]
 struct QueueFamilyIndices {
-    graphics_family: Option<u32>
+    graphics_family: Option<u32>,
+    present_family: Option<u32>
 }
 impl QueueFamilyIndices {
     fn new() -> Self {
         Self {
-            graphics_family: None
+            graphics_family: None,
+            present_family: None
         }
     }
 
     fn is_complete(&self) -> bool {
-        self.graphics_family.is_some()
+        self.graphics_family.is_some() &&
+        self.present_family.is_some()
     }
 }
 
 
 pub struct Renderer {
-    api_entry: Entry,
     //connection between application and vulkan lib
     instance: Instance,
     debug_ctx: Option<DebugCtx>,
+    //provides surface info and destroys it
+    surface_loader: ash::khr::surface::Instance,
+    //(WSI): connect vulkan and window system
+    surface: SurfaceKHR,
     //selected graphics-card
     physical_device: PhysicalDevice,
     //usage of graphics-card
@@ -79,16 +90,19 @@ pub struct Renderer {
     graphics_queue: Queue
 }
 impl Renderer {
-    pub fn new(event_loop: &ActiveEventLoop) -> Self {
+    pub fn new(event_loop: &ActiveEventLoop, window: &Window) -> Self {
         let api_entry = Entry::linked();
         let (instance, debug_ctx)  = Self::create_instance(&api_entry, &event_loop);
-        let physical_device = Self::select_physical_device(&instance);
-        let (logical_device, graphics_queue) = Self::create_logical_device(&instance, &physical_device);
+        let surface_loader = ash::khr::surface::Instance::new(&ash::Entry::linked(), &instance);
+        let surface = Self::create_surface(&api_entry, &instance, &event_loop, &window);
+        let physical_device = Self::select_physical_device(&instance, &surface_loader, &surface);
+        let (logical_device, graphics_queue) = Self::create_logical_device(&instance, &physical_device, &surface_loader, &surface);
 
         Self {
-            api_entry,
             instance,
             debug_ctx,
+            surface_loader,
+            surface,
             physical_device,
             logical_device,
             graphics_queue
@@ -203,17 +217,42 @@ impl Renderer {
         Some(DebugCtx{ debug_utils_loader, debug_call_back })
     }
 
-    fn find_queue_families(instance: &Instance, physical_device: &PhysicalDevice) -> QueueFamilyIndices {
+    fn create_surface(api_entry: &Entry, instance: &Instance, event_loop: &ActiveEventLoop, window: &Window) -> SurfaceKHR {
+        unsafe {
+            ash_window::create_surface(
+                api_entry,
+                instance,
+                event_loop.display_handle().unwrap().as_raw(),
+                window.window_handle().unwrap().as_raw(),
+                None
+            ).expect("failed creating window surface")
+        }
+    }
+
+    fn find_queue_families(instance: &Instance, physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> QueueFamilyIndices {
         let mut queue_family_indices = QueueFamilyIndices::new();
 
         unsafe {
             let queue_families = 
                 instance.get_physical_device_queue_family_properties(*physical_device);
             for (index, queue_family) in queue_families.iter().enumerate() {
+                let index = helper::usize_into_u32(index);
+
                 if queue_family.queue_flags.contains(QueueFlags::GRAPHICS)  {
-                    queue_family_indices.graphics_family = Some(
-                        helper::usize_into_u32(index)
-                    );
+                    queue_family_indices.graphics_family = 
+                        Some(index);
+                }
+
+                let present_support = 
+                    surface_loader.get_physical_device_surface_support(
+                        *physical_device,
+                        index,
+                        *surface
+                    ).expect("failed fetching surface present support!");
+                
+                if present_support {
+                    queue_family_indices.present_family = 
+                        Some(index);
                 }
 
                 if queue_family_indices.is_complete() {
@@ -225,7 +264,7 @@ impl Renderer {
         queue_family_indices
     } 
 
-    fn is_physical_device_suitable(instance: &Instance, physical_device: &PhysicalDevice) -> bool {
+    fn is_physical_device_suitable(instance: &Instance, physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> bool {
         unsafe {
             let physical_device_properties= 
                 instance.get_physical_device_properties(*physical_device);
@@ -233,7 +272,8 @@ impl Renderer {
             let _physical_device_features = 
                 instance.get_physical_device_features(*physical_device);
 
-            let queue_families = Self::find_queue_families(&instance, &physical_device);
+            let queue_families = 
+                Self::find_queue_families(&instance, &physical_device, &surface_loader, &surface);
 
             let suitable = 
                 queue_families.is_complete();
@@ -243,20 +283,21 @@ impl Renderer {
                     "suitable phyiscal-device:\n\t{:?}", 
                     physical_device_properties.device_name_as_c_str().unwrap()
                 );
+                dbg!(queue_families);
             }
 
             suitable
         }
     }
 
-    fn select_physical_device(instance: &Instance) -> PhysicalDevice {
+    fn select_physical_device(instance: &Instance, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> PhysicalDevice {
         unsafe {
             let physical_devices = instance.enumerate_physical_devices()
                 .expect("couldn't find any physical device!");
             assert!(physical_devices.len() > 0, "couldn't find any physical device!");
             
             for physical_device in physical_devices.iter() {
-                if Self::is_physical_device_suitable(&instance, &physical_device) {
+                if Self::is_physical_device_suitable(&instance, &physical_device, &surface_loader, &surface) {
                     return *physical_device                    
                 }
             }
@@ -265,8 +306,9 @@ impl Renderer {
         }
     }
 
-    fn create_logical_device(instance: &Instance, physical_device: &PhysicalDevice) -> (Device, Queue)  {
-        let queue_families = Self::find_queue_families(&instance, &physical_device); 
+    fn create_logical_device(instance: &Instance, physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> (Device, Queue)  {
+        let queue_families = 
+            Self::find_queue_families(&instance, &physical_device, &surface_loader, &surface); 
         
         let queue_priority: f32 = 1.0;
         
@@ -306,8 +348,10 @@ impl Renderer {
         
         (logical_device, graphics_queue)
     }
-   
-    pub fn draw(&self) {}
+
+
+
+    pub fn _draw(&self) {}
 }
 impl Drop for Renderer {
     //cleanup of vulkan objects (LIFO)
@@ -316,6 +360,8 @@ impl Drop for Renderer {
         unsafe {
             //destroy logical device
             self.logical_device.destroy_device(None);
+            //destroy surface
+            self.surface_loader.destroy_surface(self.surface, None); 
             //destroy debug_call_back (if it exists)
             if self.debug_ctx.is_some() {
                 let debug_ctx= self.debug_ctx.as_ref();

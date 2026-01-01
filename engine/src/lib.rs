@@ -40,14 +40,14 @@ impl ApplicationHandler for App {
 
         //create vulkan-stuff
         self.renderer = Some(
-            Renderer::new(&event_loop)
+            Renderer::new(&event_loop, self.window.as_ref().unwrap())
         );
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: winit::window::WindowId,
+        _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
         match event {
