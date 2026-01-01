@@ -1,5 +1,5 @@
 use engine::App;
 
 fn main() {
-    App::new();
+    App::new(800, 600);
 }

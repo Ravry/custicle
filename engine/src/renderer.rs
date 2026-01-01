@@ -1,6 +1,8 @@
 use std::borrow::Cow;
-use std::ffi::{self, c_char};
+use std::collections::BTreeSet;
+use std::ffi::{self, CStr, c_char};
 use std::os::raw::c_void;
+use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use ash::{
@@ -10,7 +12,7 @@ use ash::{
 };
 use ash::ext::debug_utils;
 use ash::vk::{
-    self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDevice, PhysicalDeviceFeatures, Queue, QueueFlags, SurfaceKHR
+    self, ColorSpaceKHR, ComponentMapping, ComponentSwizzle, CompositeAlphaFlagsKHR, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, Extent2D, Format, GraphicsPipelineCreateInfo, ImageAspectFlags, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo, ImageViewType, PhysicalDevice, PhysicalDeviceFeatures, PresentModeKHR, Queue, QueueFlags, SharingMode, SurfaceCapabilitiesKHR, SurfaceFormatKHR, SurfaceKHR, SwapchainCreateInfoKHR, SwapchainKHR
 };
 use winit::window::Window;
 
@@ -73,6 +75,33 @@ impl QueueFamilyIndices {
     }
 }
 
+struct Queues {
+    //queue - graphics commands can be sent to
+    graphics_queue: Queue,
+    //queue - present commands can be sent to
+    present_queue: Queue    
+}
+
+//wrapper - swapchain details (for creation and use) 
+struct SwapchainSupportDetails {
+    surface_capabilities: SurfaceCapabilitiesKHR,
+    surface_formats: Vec<SurfaceFormatKHR>,
+    surface_present_modes: Vec<PresentModeKHR>
+}
+
+struct SwapchainData {
+    //swapchain images format
+    swapchain_image_format: Format,
+    //swapchain resolution
+    swapchain_extent: Extent2D,
+    //queue of images that are waiting to be presented
+    //to screen (infrastructure for handling that)
+    swapchain: SwapchainKHR,
+    //swapchain images
+    swapchain_images: Vec<vk::Image>,
+    //describe how to access images
+    swapchain_image_views: Vec<vk::ImageView>
+}
 
 pub struct Renderer {
     //connection between application and vulkan lib
@@ -86,17 +115,27 @@ pub struct Renderer {
     physical_device: PhysicalDevice,
     //usage of graphics-card
     logical_device: Device,
-    //queue - graphics commands can be sent to
-    graphics_queue: Queue
+    //queues - commands can be sent to
+    queues: Queues,
+    //provides swapchain loading
+    swapchain_loader: ash::khr::swapchain::Device,
+    //swapchain wrapper
+    swapchain_data: SwapchainData
+
 }
 impl Renderer {
+    const DEVICE_EXTENSIONS: [&CStr; 1] = [vk::KHR_SWAPCHAIN_NAME];
+
     pub fn new(event_loop: &ActiveEventLoop, window: &Window) -> Self {
         let api_entry = Entry::linked();
         let (instance, debug_ctx)  = Self::create_instance(&api_entry, &event_loop);
-        let surface_loader = ash::khr::surface::Instance::new(&ash::Entry::linked(), &instance);
+        let surface_loader = ash::khr::surface::Instance::new(&api_entry, &instance);
         let surface = Self::create_surface(&api_entry, &instance, &event_loop, &window);
         let physical_device = Self::select_physical_device(&instance, &surface_loader, &surface);
-        let (logical_device, graphics_queue) = Self::create_logical_device(&instance, &physical_device, &surface_loader, &surface);
+        let (logical_device, queues) = Self::create_logical_device(&instance, &physical_device, &surface_loader, &surface);
+        let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &logical_device);
+        let swapchain_data = Self::create_swapchain(&window, &instance, &physical_device, &logical_device, &surface_loader, &surface, &swapchain_loader);
+        let graphics_pipeline = Self::create_graphics_pipeline();
 
         Self {
             instance,
@@ -105,7 +144,9 @@ impl Renderer {
             surface,
             physical_device,
             logical_device,
-            graphics_queue
+            queues,
+            swapchain_loader,
+            swapchain_data
         }
     }
 
@@ -264,6 +305,22 @@ impl Renderer {
         queue_family_indices
     } 
 
+    fn check_physical_device_extension_support(instance: &Instance, physical_device: &PhysicalDevice) -> bool {
+        let available_device_extensions = unsafe { instance
+            .enumerate_device_extension_properties(*physical_device)
+            .expect("failed enumerating device extension properties!")
+        };
+
+        let mut required_extensions : BTreeSet<_> = 
+            Self::DEVICE_EXTENSIONS.iter().map(|ext| *ext).collect();
+
+        for extension in available_device_extensions.iter() {
+            required_extensions.remove(extension.extension_name_as_c_str().unwrap());
+        }
+
+        required_extensions.is_empty()
+    }
+
     fn is_physical_device_suitable(instance: &Instance, physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> bool {
         unsafe {
             let physical_device_properties= 
@@ -275,8 +332,22 @@ impl Renderer {
             let queue_families = 
                 Self::find_queue_families(&instance, &physical_device, &surface_loader, &surface);
 
+            let extension_support = 
+                Self::check_physical_device_extension_support(&instance, &physical_device);
+
+            let mut swapchain_adequate = false;
+            if (extension_support) {
+                let swapchain_details = 
+                    Self::query_swapchain_support_details(&physical_device, &surface_loader, &surface);
+                //swapchain is sufficient when there is at least one format and one present mode
+                swapchain_adequate = !swapchain_details.surface_formats.is_empty() &&
+                                            !swapchain_details.surface_present_modes.is_empty();
+            }
+
             let suitable = 
-                queue_families.is_complete();
+                queue_families.is_complete() &&
+                extension_support &&
+                swapchain_adequate;
 
             if suitable {
                 println!(
@@ -306,30 +377,47 @@ impl Renderer {
         }
     }
 
-    fn create_logical_device(instance: &Instance, physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> (Device, Queue)  {
+    fn create_logical_device(instance: &Instance, physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> (Device, Queues)  {
+        //creating queues:
         let queue_families = 
             Self::find_queue_families(&instance, &physical_device, &surface_loader, &surface); 
         
+        //set of unique items
+        let unique_queue_families: BTreeSet<u32> = [
+            queue_families.graphics_family.unwrap(),
+            queue_families.present_family.unwrap()
+            ].into_iter().collect();
+        
+        let mut queues_create_info_vec = 
+            Vec::with_capacity(unique_queue_families.len());
+
         let queue_priority: f32 = 1.0;
-        
-        //number of queues for a queue family
-        let graphics_queue_create_info = 
-            DeviceQueueCreateInfo {
-                queue_family_index: queue_families.graphics_family.unwrap(),
-                queue_count: 1,
-                p_queue_priorities: &raw const queue_priority,
-                ..Default::default()
-            };
-        
+
+        unique_queue_families.iter().for_each(|queue_family| {
+            queues_create_info_vec.push(
+                DeviceQueueCreateInfo {
+                    queue_family_index: *queue_family,
+                    queue_count: 1,
+                    p_queue_priorities: &raw const queue_priority,
+                    ..Default::default()    
+                }
+            );
+        });
+
         let logical_device_features = 
             PhysicalDeviceFeatures {
                 ..Default::default()
             };
-        
+
+        let required_logical_device_extensions : Vec<_> = 
+            Self::DEVICE_EXTENSIONS.iter().map(|extension| {extension.as_ptr()}).collect();
+
         let logical_device_create_info = DeviceCreateInfo {
-            p_queue_create_infos: &raw const graphics_queue_create_info,
-            queue_create_info_count: 1,
+            p_queue_create_infos: &raw const queues_create_info_vec[0],
+            queue_create_info_count: helper::usize_into_u32(queues_create_info_vec.len()),
             p_enabled_features: &raw const logical_device_features,
+            pp_enabled_extension_names: &raw const required_logical_device_extensions[0],
+            enabled_extension_count: helper::usize_into_u32(required_logical_device_extensions.len()),
             ..Default::default()
         };
 
@@ -345,11 +433,212 @@ impl Renderer {
                 0
             )
         };
+
+        let present_queue= unsafe {
+            logical_device.get_device_queue(
+                queue_families.present_family.unwrap(), 
+                0
+            )
+        };
+
+        let queues = Queues {
+            graphics_queue,
+            present_queue
+        };
         
-        (logical_device, graphics_queue)
+        (logical_device, queues)
     }
 
+    fn query_swapchain_support_details(physical_device: &PhysicalDevice, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR) -> SwapchainSupportDetails {
+        unsafe {
+            let surface_capabilities = surface_loader
+                .get_physical_device_surface_capabilities(*physical_device, *surface)
+                .expect("failed getting physical-device surface capabilities");
 
+            let surface_formats = surface_loader
+                .get_physical_device_surface_formats(*physical_device, *surface)
+                .expect("failed getting physical-device surface formats");
+
+            let surface_present_modes = surface_loader
+                .get_physical_device_surface_present_modes(*physical_device, *surface)
+                .expect("failed getting physical-device surface present modes");
+
+
+            SwapchainSupportDetails {
+                surface_capabilities,
+                surface_formats,
+                surface_present_modes
+            }
+        }
+    }
+
+    fn chose_swapchain_surface_format(available_surface_formats: &Vec<SurfaceFormatKHR>) -> SurfaceFormatKHR {
+        for surface_format in available_surface_formats {
+            if surface_format.format == Format::R8G8B8A8_SRGB && surface_format.color_space == ColorSpaceKHR::SRGB_NONLINEAR {
+                return *surface_format
+            }
+        }
+        *available_surface_formats.first().unwrap()
+    }
+
+    fn chose_swapchain_present_mode(available_surface_present_modes: &Vec<PresentModeKHR>) -> PresentModeKHR {
+        for present_mode in available_surface_present_modes.iter() {
+            /*
+                Instead of blocking the application when the queue is full, the images that are already queued
+                are simply replaced with the newer ones. This mode can be used to render frames as fast as 
+                possible while still avoiding tearing, resulting in fewer latency issues than standard 
+                vertical sync. This is commonly known as "triple buffering" 
+            */
+            if *present_mode == PresentModeKHR::MAILBOX {
+                return *present_mode
+            }
+        }
+
+        /*
+            swap chain is a queue where the display takes an image from the front of the queue when the display 
+            is refreshed and the program inserts rendered images at the back of the queue. If the queue is full 
+            then the program has to wait. This is most similar to vertical sync as found in modern games. 
+            The moment that the display is refreshed is known as "vertical blank".
+        */
+        PresentModeKHR::FIFO //this mode is guranteed to be available
+    }
+
+    fn chose_swapchain_extent(surface_capabilities: &SurfaceCapabilitiesKHR, window: &Window) -> Extent2D {
+        //if current_extent == u32::MAX then the resolution of the window
+        //may be differing from the current_extent (e.g. retina-display) 
+        if surface_capabilities.current_extent.width != u32::MAX {
+            return surface_capabilities.current_extent
+        } else {
+            let logical_inner_size: LogicalSize<u32> = window.inner_size().to_logical(window.scale_factor());
+            Extent2D { 
+                width: u32::clamp(
+                    logical_inner_size.width,
+                    surface_capabilities.min_image_extent.width,
+                    surface_capabilities.min_image_extent.height
+                ),
+                height: u32::clamp(
+                    logical_inner_size.height,
+                    surface_capabilities.min_image_extent.height,
+                    surface_capabilities.max_image_extent.height
+                )
+            }
+        }
+    }
+
+    fn create_swapchain(window: &Window, instance: &Instance, physical_device: &PhysicalDevice, logical_device: &Device, surface_loader: &ash::khr::surface::Instance, surface: &SurfaceKHR, swapchain_loader: &ash::khr::swapchain::Device) -> SwapchainData {
+        let surface_details = 
+            Self::query_swapchain_support_details(&physical_device, &surface_loader, &surface);
+        //https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain#page_Surface-format
+        let surface_format = 
+            Self::chose_swapchain_surface_format(&surface_details.surface_formats);
+        //https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain#page_Presentation-mode
+        let surface_present_mode = 
+            Self::chose_swapchain_present_mode(&surface_details.surface_present_modes);
+        //resolution of the swapchain-images
+        //https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain#page_Swap-extent
+        let swapchain_extent = 
+            Self::chose_swapchain_extent(&surface_details.surface_capabilities, &window);
+
+        let mut swapchain_min_image_count =
+            surface_details.surface_capabilities.min_image_count + 1;
+        
+        //max_image_count = 0: there is no maximum
+        if surface_details.surface_capabilities.max_image_count > 0 &&
+           surface_details.surface_capabilities.max_image_count < swapchain_min_image_count {
+            swapchain_min_image_count = surface_details.surface_capabilities.max_image_count;
+        }
+
+        let mut swapchain_create_info = SwapchainCreateInfoKHR { 
+            surface: *surface,
+            min_image_count: swapchain_min_image_count,
+            image_format: surface_format.format,
+            image_color_space: surface_format.color_space,
+            image_extent: swapchain_extent,
+            image_array_layers: 1, 
+            image_usage: ImageUsageFlags::COLOR_ATTACHMENT,
+            pre_transform: surface_details.surface_capabilities.current_transform,
+            composite_alpha: CompositeAlphaFlagsKHR::OPAQUE,
+            present_mode: surface_present_mode,
+            clipped: vk::TRUE,
+            ..Default::default()
+        };
+
+        let queue_family_indices = 
+            Self::find_queue_families(instance, &physical_device, &surface_loader, &surface);
+        
+        let queue_family_indices_vec = vec![
+            queue_family_indices.graphics_family.unwrap(),
+            queue_family_indices.present_family.unwrap()
+        ];
+
+        if queue_family_indices.graphics_family.unwrap() != queue_family_indices.present_family.unwrap() {
+            swapchain_create_info.image_sharing_mode = SharingMode::CONCURRENT;
+            swapchain_create_info.p_queue_family_indices = &raw const queue_family_indices_vec[0];
+            swapchain_create_info.queue_family_index_count = 2;
+        } else {
+            swapchain_create_info.image_sharing_mode = SharingMode::EXCLUSIVE;
+        }
+
+        let swapchain = unsafe {
+            swapchain_loader
+                .create_swapchain(&swapchain_create_info, None)
+                .expect("failed creating swapchain!")
+        };
+
+
+        let swapchain_images = unsafe {
+            swapchain_loader
+                .get_swapchain_images(swapchain)
+                .expect("failed getting swapchain images")
+        };
+
+        dbg!(&swapchain_images);
+
+        let mut swapchain_image_views: Vec<ImageView> = Vec::with_capacity(swapchain_images.len());
+        swapchain_images.iter().for_each(|swapchain_image| {
+            let swapchain_image_view_create_info =
+                ImageViewCreateInfo {
+                    image: *swapchain_image,
+                    view_type: ImageViewType::TYPE_2D,
+                    format: surface_format.format,
+                    components: ComponentMapping {
+                        r: ComponentSwizzle::IDENTITY,
+                        g: ComponentSwizzle::IDENTITY,
+                        b: ComponentSwizzle::IDENTITY,
+                        a: ComponentSwizzle::IDENTITY
+                    },
+                    subresource_range: ImageSubresourceRange {
+                        aspect_mask: ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0, 
+                        layer_count: 1
+                    },
+                    ..Default::default()
+                };
+
+            swapchain_image_views.push(
+                unsafe {
+                    logical_device.create_image_view(
+                        &swapchain_image_view_create_info,
+                        None
+                    ).expect("failed creating image view")
+                }
+            );                       
+        });
+
+        SwapchainData {
+            swapchain_image_format: surface_format.format,
+            swapchain_extent,
+            swapchain,
+            swapchain_images,
+            swapchain_image_views
+        }
+    }
+
+    fn create_graphics_pipeline() {
+        
+    }
 
     pub fn _draw(&self) {}
 }
@@ -358,6 +647,12 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         println!("cleaning up the renderer!");
         unsafe {
+            //destroy swapchain image views
+            self.swapchain_data.swapchain_image_views.iter().for_each(|swapchain_image_view| {
+                self.logical_device.destroy_image_view(*swapchain_image_view, None);
+            });
+            //destroy swapchain
+            self.swapchain_loader.destroy_swapchain(self.swapchain_data.swapchain, None);
             //destroy logical device
             self.logical_device.destroy_device(None);
             //destroy surface
