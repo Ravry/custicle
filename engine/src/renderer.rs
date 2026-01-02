@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::{self, CStr, c_char};
+use std::fs;
+use std::io::Cursor;
 use std::os::raw::c_void;
+use ash::util::read_spv;
 use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -12,7 +15,7 @@ use ash::{
 };
 use ash::ext::debug_utils;
 use ash::vk::{
-    self, ColorSpaceKHR, ComponentMapping, ComponentSwizzle, CompositeAlphaFlagsKHR, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, Extent2D, Format, GraphicsPipelineCreateInfo, ImageAspectFlags, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo, ImageViewType, PhysicalDevice, PhysicalDeviceFeatures, PresentModeKHR, Queue, QueueFlags, SharingMode, SurfaceCapabilitiesKHR, SurfaceFormatKHR, SurfaceKHR, SwapchainCreateInfoKHR, SwapchainKHR
+    self, AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, ColorComponentFlags, ColorSpaceKHR, ComponentMapping, ComponentSwizzle, CompositeAlphaFlagsKHR, CullModeFlags, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT, DebugUtilsMessengerEXT, DeviceCreateInfo, DeviceQueueCreateInfo, DynamicState, Extent2D, Format, FrontFace, GraphicsPipelineCreateInfo, ImageAspectFlags, ImageLayout, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo, ImageViewType, PhysicalDevice, PhysicalDeviceFeatures, Pipeline, PipelineBindPoint, PipelineCache, PipelineColorBlendAttachmentState, PipelineColorBlendStateCreateInfo, PipelineDynamicStateCreateInfo, PipelineInputAssemblyStateCreateInfo, PipelineLayout, PipelineLayoutCreateInfo, PipelineMultisampleStateCreateInfo, PipelineRasterizationStateCreateInfo, PipelineShaderStageCreateInfo, PipelineVertexInputStateCreateInfo, PipelineViewportStateCreateInfo, PolygonMode, PresentModeKHR, PrimitiveTopology, Queue, QueueFlags, RenderPass, RenderPassCreateInfo, SampleCountFlags, ShaderModule, ShaderModuleCreateInfo, ShaderStageFlags, SharingMode, SubpassDescription, SurfaceCapabilitiesKHR, SurfaceFormatKHR, SurfaceKHR, SwapchainCreateInfoKHR, SwapchainKHR
 };
 use winit::window::Window;
 
@@ -103,6 +106,11 @@ struct SwapchainData {
     swapchain_image_views: Vec<vk::ImageView>
 }
 
+struct PipelineData {
+    pipeline_layout: PipelineLayout,
+    pipeline: Pipeline
+}
+
 pub struct Renderer {
     //connection between application and vulkan lib
     instance: Instance,
@@ -120,8 +128,12 @@ pub struct Renderer {
     //provides swapchain loading
     swapchain_loader: ash::khr::swapchain::Device,
     //swapchain wrapper
-    swapchain_data: SwapchainData
-
+    swapchain_data: SwapchainData,
+    //defines attachments referenced by
+    //pipeline stages and their usage
+    render_pass: RenderPass,
+    //pipeline wrapper
+    graphics_pipeline_data: PipelineData
 }
 impl Renderer {
     const DEVICE_EXTENSIONS: [&CStr; 1] = [vk::KHR_SWAPCHAIN_NAME];
@@ -135,7 +147,8 @@ impl Renderer {
         let (logical_device, queues) = Self::create_logical_device(&instance, &physical_device, &surface_loader, &surface);
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &logical_device);
         let swapchain_data = Self::create_swapchain(&window, &instance, &physical_device, &logical_device, &surface_loader, &surface, &swapchain_loader);
-        let graphics_pipeline = Self::create_graphics_pipeline();
+        let render_pass = Self::create_render_pass(&logical_device, &swapchain_data);
+        let graphics_pipeline_data = Self::create_graphics_pipeline(&logical_device, &swapchain_data, &render_pass);
 
         Self {
             instance,
@@ -146,7 +159,9 @@ impl Renderer {
             logical_device,
             queues,
             swapchain_loader,
-            swapchain_data
+            swapchain_data,
+            render_pass,
+            graphics_pipeline_data
         }
     }
 
@@ -336,7 +351,7 @@ impl Renderer {
                 Self::check_physical_device_extension_support(&instance, &physical_device);
 
             let mut swapchain_adequate = false;
-            if (extension_support) {
+            if extension_support {
                 let swapchain_details = 
                     Self::query_swapchain_support_details(&physical_device, &surface_loader, &surface);
                 //swapchain is sufficient when there is at least one format and one present mode
@@ -636,8 +651,232 @@ impl Renderer {
         }
     }
 
-    fn create_graphics_pipeline() {
+    fn create_render_pass(logical_device: &Device, swapchain_data: &SwapchainData) -> RenderPass {
+        let color_attachment_description = 
+            AttachmentDescription {
+                format: swapchain_data.swapchain_image_format,
+                samples: SampleCountFlags::TYPE_1,
+                //load-op for color/depth buffers
+                load_op: AttachmentLoadOp::CLEAR,
+                //store-op for color/depth buffers
+                store_op: AttachmentStoreOp::STORE,
+                //load-op for stencil buffers
+                stencil_load_op: AttachmentLoadOp::DONT_CARE,
+                //store-op for stencil buffers
+                stencil_store_op: AttachmentStoreOp::DONT_CARE,
+                //images need to be transitioned to specific layouts that 
+                //are suitable for operation that they're be involved in
+                initial_layout: ImageLayout::UNDEFINED,
+                //-''-
+                final_layout: ImageLayout::PRESENT_SRC_KHR,
+                
+                ..Default::default()
+            };
         
+        let color_attachment_reference = 
+            AttachmentReference {
+                attachment: 0,
+                layout: ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            };
+
+        let subpass_description = 
+            SubpassDescription {
+                pipeline_bind_point: PipelineBindPoint::GRAPHICS,
+                //index of the attachment in this "array" is
+                //referenced from the fragment shader with:
+                //``layout (location = 0) out vec4 out_color``
+                p_color_attachments: &raw const color_attachment_reference,
+                color_attachment_count: 1,
+                ..Default::default()
+            };
+
+        let render_pass_create_info = 
+            RenderPassCreateInfo {
+                attachment_count: 1,
+                p_attachments: &raw const color_attachment_description,
+                subpass_count: 1,
+                p_subpasses: &raw const subpass_description,
+                ..Default::default()
+            };
+        
+        unsafe {
+            logical_device
+                .create_render_pass(&render_pass_create_info, None)
+                .expect("failed creating render pass")
+        }
+    }
+
+    fn create_shader_module(logical_device: &Device, byte_code: &Vec<u8>) -> ShaderModule {
+        let spirv = read_spv(&mut Cursor::new(byte_code))
+            .expect("failed to convert u8-vec to u32-vec");
+
+        let shader_module_create_info = ShaderModuleCreateInfo {
+            code_size: spirv.len() * std::mem::size_of::<u32>(),
+            p_code: &raw const spirv[0],
+            ..Default::default()
+        };
+
+
+        unsafe {
+            logical_device
+                .create_shader_module(&shader_module_create_info, None)
+                .expect("failed creating shader module!")
+        }
+    }
+
+    fn create_graphics_pipeline(logical_device: &Device, swapchain_data: &SwapchainData, render_pass: &RenderPass) -> PipelineData {
+        let vert_byte_src = 
+            fs::read("./shaders/default_vert.spv")
+                .expect("failed reading vertex shader");
+        let frag_byte_src = 
+            fs::read("./shaders/default_frag.spv")
+                .expect("failed reading fragment shader");
+
+        let vert_shader_module = Self::create_shader_module(&logical_device, &vert_byte_src);
+        let frag_shader_module = Self::create_shader_module(&logical_device, &frag_byte_src);
+
+        let vert_shader_stage_create_info = 
+            PipelineShaderStageCreateInfo {
+                stage: ShaderStageFlags::VERTEX,
+                module: vert_shader_module,
+                p_name: c"main".as_ptr(),
+                ..Default::default()
+            };
+        
+        let frag_shader_stage_create_info = 
+            PipelineShaderStageCreateInfo {
+                stage: ShaderStageFlags::FRAGMENT,
+                module: frag_shader_module,
+                p_name: c"main".as_ptr(),
+                ..Default::default()
+            };
+
+        let shader_stage_create_infos = 
+            [vert_shader_stage_create_info, frag_shader_stage_create_info];
+
+        let vertex_input_create_info = 
+            PipelineVertexInputStateCreateInfo {
+            ..Default::default()
+            };
+
+        let input_assembly_create_info = 
+            PipelineInputAssemblyStateCreateInfo {
+                topology: PrimitiveTopology::TRIANGLE_LIST,
+                primitive_restart_enable: vk::FALSE,
+                ..Default::default()
+            };
+
+        let dynamic_states = [DynamicState::VIEWPORT, DynamicState::SCISSOR];
+        let dynamic_state_create_info = 
+            PipelineDynamicStateCreateInfo {
+                dynamic_state_count: helper::usize_into_u32(dynamic_states.len()),
+                p_dynamic_states: &raw const dynamic_states[0],
+                ..Default::default()
+            };
+        
+        let viewport_create_info = 
+            PipelineViewportStateCreateInfo {
+                viewport_count: 1,
+                scissor_count: 1,
+                ..Default::default()
+            };
+
+        let rasterization_create_info = 
+            PipelineRasterizationStateCreateInfo {
+                //TRUE: fragments beyond the near and far planes are clamped
+                //      to them as opposed to discarding them
+                depth_clamp_enable: vk::FALSE,
+                //TRUE: geometry never passes through rasterizer stage
+                //      -> disables any output to framebuffer
+                rasterizer_discard_enable: vk::FALSE,
+                polygon_mode: PolygonMode::FILL,
+                line_width: 1.0,
+                cull_mode: CullModeFlags::BACK,
+                front_face: FrontFace::CLOCKWISE,
+                depth_bias_enable: vk::FALSE,
+                ..Default::default()
+            };
+
+        let multisample_create_info = 
+            PipelineMultisampleStateCreateInfo {
+                sample_shading_enable: vk::FALSE,
+                rasterization_samples: SampleCountFlags::TYPE_1,
+                ..Default::default()
+            };
+
+        //per-attatched-framebuffer configuration
+        let color_blend_attachment_state = 
+            PipelineColorBlendAttachmentState {
+                color_write_mask: ColorComponentFlags::R |
+                                ColorComponentFlags::G |
+                                ColorComponentFlags::B |
+                                ColorComponentFlags::A,
+                blend_enable: vk::FALSE,
+                ..Default::default()
+            };
+        
+        let color_blend_create_info = 
+            PipelineColorBlendStateCreateInfo {
+                logic_op_enable: vk::FALSE,
+                attachment_count: 1,
+                p_attachments: &raw const color_blend_attachment_state,
+                ..Default::default()
+            };
+
+        //specification of uniform values in shaders
+        let pipeline_layout_create_info = PipelineLayoutCreateInfo::default();
+
+        let pipeline_layout = unsafe {
+            logical_device
+                .create_pipeline_layout(
+                    &pipeline_layout_create_info,
+                    None
+                )
+                .expect("failed creating pipeline layout")
+        };
+
+        let graphics_pipeline_create_info = 
+            GraphicsPipelineCreateInfo {
+                //vertex and fragment shader-stages
+                stage_count: 2,
+                p_stages: &raw const shader_stage_create_infos[0],
+                //fixed function stages
+                p_vertex_input_state: &raw const vertex_input_create_info,
+                p_input_assembly_state: &raw const input_assembly_create_info,
+                p_viewport_state: &raw const viewport_create_info,
+                p_rasterization_state: &raw const rasterization_create_info,
+                p_multisample_state: &raw const multisample_create_info,
+                p_color_blend_state: &raw const color_blend_create_info,
+                p_dynamic_state: &raw const dynamic_state_create_info,
+                //pipeline layout
+                layout: pipeline_layout,
+                render_pass: *render_pass,
+                //index of the sub-(render)-pass where 
+                //this graphics pipeline will be used
+                subpass: 0,
+                ..Default::default()
+            };
+
+        let pipelines = unsafe {
+            logical_device.create_graphics_pipelines(
+                PipelineCache::null(),
+                &[graphics_pipeline_create_info],
+                None
+            )
+            .expect("failed creating graphics pipelines")
+        };
+        let pipeline = pipelines[0];
+        
+        unsafe {
+            logical_device.destroy_shader_module(frag_shader_module, None);
+            logical_device.destroy_shader_module(vert_shader_module, None);
+        }
+
+
+        PipelineData {
+            pipeline_layout,
+            pipeline
+        }
     }
 
     pub fn _draw(&self) {}
@@ -647,6 +886,14 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         println!("cleaning up the renderer!");
         unsafe {
+            //destroy pipeline
+            self.logical_device.destroy_pipeline(self.graphics_pipeline_data.pipeline, None);
+            //destroy pipeline layout
+            self.logical_device
+                .destroy_pipeline_layout(self.graphics_pipeline_data.pipeline_layout, None);
+            //destroy render pass
+            self.logical_device
+                .destroy_render_pass(self.render_pass, None);
             //destroy swapchain image views
             self.swapchain_data.swapchain_image_views.iter().for_each(|swapchain_image_view| {
                 self.logical_device.destroy_image_view(*swapchain_image_view, None);
